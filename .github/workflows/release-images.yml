@@ -1,0 +1,124 @@
+name: Publish release images
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-images-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build ${{ matrix.image_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image_name: librechat
+            file: Dockerfile
+            target: node
+            description: LibreChat application image
+          - image_name: librechat-api
+            file: Dockerfile.multi
+            target: api-build
+            description: LibreChat API image
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - name: Validate release and compute metadata
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          tag_regex='^v[0-9]+[.][0-9]+[.][0-9]+(-rc[0-9]+)?$'
+          stable_regex='^v[0-9]+[.][0-9]+[.][0-9]+$'
+
+          if [[ ! "$RELEASE_TAG" =~ $tag_regex ]]; then
+            echo "::error::Release tag must use v<semver> or v<semver>-rcN"
+            exit 1
+          fi
+
+          git fetch --tags --force
+          latest_stable_tag="$({
+            git tag --list 'v[0-9]*' --sort=-v:refname |
+              grep -E '^v[0-9]+[.][0-9]+[.][0-9]+$' |
+              head -n 1
+          } || true)"
+
+          publish_latest=false
+          if [[ "$RELEASE_TAG" =~ $stable_regex ]] && [[ "$RELEASE_TAG" == "$latest_stable_tag" ]]; then
+            publish_latest=true
+          fi
+
+          printf 'tag=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          printf 'date=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+          printf 'publish_latest=%s\n' "$publish_latest" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare build environment
+        run: cp .env.example .env
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image_name }}
+          tags: |
+            type=raw,value=${{ steps.release.outputs.tag }}
+            type=raw,value=latest,enable=${{ steps.release.outputs.publish_latest }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.image_name }}
+            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.release.outputs.commit }}
+            org.opencontainers.image.version=${{ steps.release.outputs.tag }}
+
+      - name: Build and publish image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_COMMIT=${{ steps.release.outputs.commit }}
+            BUILD_BRANCH=${{ steps.release.outputs.tag }}
+            BUILD_DATE=${{ steps.release.outputs.date }}
+          cache-from: type=gha,scope=release-${{ matrix.image_name }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.image_name }}
+          provenance: mode=max
+          sbom: true
